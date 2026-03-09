@@ -2,6 +2,7 @@
 import collections
 import copy
 import contextlib
+import random
 from copy import deepcopy
 import functools
 from functools import partial, wraps
@@ -4885,7 +4886,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                            total_tokens,
                            scheduled_tokens,
                            is_prompt,
-                           block_id=0):
+                           block_id=0,
+                           block_ids_override=None):
         # Spec decode: blocks should include look ahead tokens (eagle)
         total_tokens_for_blocks = total_tokens
         if self.speculative_config and self.speculative_config.use_eagle():
@@ -4897,12 +4899,21 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         prompt_token_ids = list(range(total_tokens))
         num_blocks = round_up(total_tokens_for_blocks, self.block_size) // self.block_size
-
         req_id = f'{len(requests)}'
-        block_ids = [[block_id] *
-                     (round_up(total_tokens_for_blocks, g.kv_cache_spec.block_size) // g.kv_cache_spec.block_size)
-                     for g in self.kv_cache_config.kv_cache_groups] if self.num_mamba_layers > 0 else [[block_id] *
-                                                                                                       num_blocks]
+        if block_ids_override is not None:
+            # Use caller-provided block IDs (globally unique)
+            block_ids = [block_ids_override]
+        elif self.use_contiguous_pa:
+            if self.num_mamba_layers > 0:
+                block_ids = [list(range(block_id, block_id +
+                                 round_up(total_tokens_for_blocks, g.kv_cache_spec.block_size) // g.kv_cache_spec.block_size))
+                             for g in self.kv_cache_config.kv_cache_groups]
+            else:
+                # Sequential block IDs: [block_id, block_id+1, ..., block_id+num_blocks-1]
+                seq_block_ids = list(range(block_id, block_id + num_blocks))
+                block_ids = [seq_block_ids]
+        else:
+            block_ids = [[block_id] * num_blocks]
         if self.is_pooling_model:
             model = cast(VllmModelForPooling, self.get_model())
             if hasattr(self.model_config, 'task') and self.model_config.task is not None:
@@ -5139,20 +5150,51 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                             is_prompt=True)
         if decode_cfg:
             decode_bs, decode_query_len, decode_num_blocks = decode_cfg
+            max_blocks_per_req = self.max_model_len // self.block_size
             if self.use_contiguous_pa:
-                decode_seq_lengths = [self.block_size] * decode_bs
-                block_id = decode_num_blocks - 1
+                # Cap total blocks so no request exceeds max_model_len
+                capped_num_blocks = min(decode_num_blocks,
+                                        max_blocks_per_req * decode_bs)
+                decode_seq_lengths = self._generate_seq_lengths(
+                    decode_bs, capped_num_blocks, self.block_size)
+                # Assign non-overlapping sequential block ID ranges
+                block_id_offset = 0
+                for dsl in decode_seq_lengths:
+                    self._add_dummy_request(requests,
+                                            scheduled_tokens,
+                                            num_computed_tokens=dsl,
+                                            total_tokens=dsl,
+                                            scheduled_tokens=1,
+                                            is_prompt=False,
+                                            block_id=block_id_offset)
+                    block_id_offset += round_up(
+                        dsl, self.block_size) // self.block_size
             else:
-                decode_seq_lengths = self._generate_seq_lengths(decode_bs, decode_num_blocks, self.block_size)
-                block_id = 0
-            for dsl in decode_seq_lengths:
-                self._add_dummy_request(requests,
-                                        scheduled_tokens,
-                                        num_computed_tokens=dsl,
-                                        total_tokens=dsl,
-                                        scheduled_tokens=1,
-                                        is_prompt=False,
-                                        block_id=block_id)
+                decode_seq_lengths = self._generate_seq_lengths(
+                    decode_bs, decode_num_blocks, self.block_size)
+                # Pre-sample globally unique scattered block IDs
+                total_blocks_needed = sum(
+                    round_up(dsl, self.block_size) // self.block_size
+                    for dsl in decode_seq_lengths)
+                available_blocks = getattr(self, '_dummy_num_blocks',
+                                           total_blocks_needed)
+                if available_blocks >= total_blocks_needed:
+                    all_block_ids = random.sample(
+                        range(available_blocks), total_blocks_needed)
+                else:
+                    all_block_ids = list(range(total_blocks_needed))
+                offset = 0
+                for dsl in decode_seq_lengths:
+                    n = round_up(dsl, self.block_size) // self.block_size
+                    self._add_dummy_request(
+                        requests,
+                        scheduled_tokens,
+                        num_computed_tokens=dsl,
+                        total_tokens=dsl,
+                        scheduled_tokens=1,
+                        is_prompt=False,
+                        block_ids_override=all_block_ids[offset:offset + n])
+                    offset += n
         self._execute_dummy_scenario(requests, scheduled_tokens)
 
     def _execute_dummy_scenario(self, requests, scheduled_tokens):
